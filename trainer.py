@@ -66,10 +66,10 @@ class P3Trainer:
             dist.all_gather_object(object_list=self.edge_size_lst,
                                    obj=self.edge_size_lst[self.rank])
 
-            for rank, edge_size, src_node_size, dst_node_size in self.edge_size_lst:
-                self.src_edge_buffer_lst[rank].resize_(edge_size)
-                self.dst_edge_buffer_lst[rank].resize_(edge_size)
-                self.input_node_buffer_lst[rank].resize_(src_node_size)
+            for r, edge_size, src_node_size, dst_node_size in self.edge_size_lst:
+                self.src_edge_buffer_lst[r].resize_(edge_size)
+                self.dst_edge_buffer_lst[r].resize_(edge_size)
+                self.input_node_buffer_lst[r].resize_(src_node_size)
 
             handle1 = dist.all_gather(tensor_list=self.input_node_buffer_lst,
                                       tensor=input_nodes,
@@ -82,8 +82,8 @@ class P3Trainer:
                                       async_op=True)
             handle1.wait()
 
-            for rank, _input_nodes in enumerate(self.input_node_buffer_lst):
-                self.input_feat_buffer_lst[rank] = self.emb_layer(
+            for r, _input_nodes in enumerate(self.input_node_buffer_lst):
+                self.input_feat_buffer_lst[r] = self.emb_layer(
                     _input_nodes.cpu()).cuda()
 
             handle2.wait()
@@ -118,21 +118,19 @@ class P3Trainer:
             output_pred = self.other_layer(blocks[1:], local_hid)
             loss = F.cross_entropy(output_pred, output_labels)
 
-            self.other_optimizer.zero_grad()
+            self.emb_optimizer.zero_grad()
             self.first_optimizer.zero_grad()
-            loss.backward()
-            self.other_optimizer.step()
+            self.other_optimizer.zero_grad()
 
-            # embedding
+            loss.backward()
 
             for r, global_grad in enumerate(self.global_grad_lst):
                 if r != self.rank:
-                    self.first_layer.zero_grad()
                     self.local_hid_buffer_lst[r].backward(global_grad)
 
-            self.first_optimizer.step()
-            self.emb_optimizer.zero_grad()
             self.emb_optimizer.step()
+            self.first_optimizer.step()
+            self.other_optimizer.step()
 
     def inference(self, dataloader, labels, num_classes):
         self.emb_layer.eval()
@@ -154,10 +152,10 @@ class P3Trainer:
                 )  # rank, edge_size, input_node_size
                 dist.all_gather_object(object_list=self.edge_size_lst,
                                        obj=self.edge_size_lst[self.rank])
-                for rank, edge_size, src_node_size, dst_node_size in self.edge_size_lst:
-                    self.src_edge_buffer_lst[rank].resize_(edge_size)
-                    self.dst_edge_buffer_lst[rank].resize_(edge_size)
-                    self.input_node_buffer_lst[rank].resize_(src_node_size)
+                for r, edge_size, src_node_size, dst_node_size in self.edge_size_lst:
+                    self.src_edge_buffer_lst[r].resize_(edge_size)
+                    self.dst_edge_buffer_lst[r].resize_(edge_size)
+                    self.input_node_buffer_lst[r].resize_(src_node_size)
                     # input_feat_buffer_lst[rank].resize_([src_node_size, local_feat_width])
                 # dist.barrier()
                 handle1 = dist.all_gather(
@@ -171,9 +169,8 @@ class P3Trainer:
                                           tensor=dst,
                                           async_op=True)
                 handle1.wait()
-                for rank, _input_nodes in enumerate(
-                        self.input_node_buffer_lst):
-                    self.input_feat_buffer_lst[rank] = self.emb_layer(
+                for r, _input_nodes in enumerate(self.input_node_buffer_lst):
+                    self.input_feat_buffer_lst[r] = self.emb_layer(
                         _input_nodes.to('cpu')).cuda()
                 handle2.wait()
                 handle3.wait()
