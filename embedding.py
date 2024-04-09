@@ -12,7 +12,8 @@ class Embedding(nn.Module):
         self.tensor = torch.zeros(num_embeddings,
                                   embedding_dim,
                                   dtype=torch.float32).uniform_(-1, 1)
-        self.traces = []
+        self.ids_traces = []
+        self.emb_traces = []
         self.name = "embedding" + str(id(self))
 
     def forward(self, ids):
@@ -26,7 +27,8 @@ class Embedding(nn.Module):
 
         if F.is_recording():
             emb = F.attach_grad(emb)
-            self.traces.append((ids.to('cuda', non_blocking=True), emb))
+            self.ids_traces.append(ids.to('cuda', non_blocking=True))
+            self.emb_traces.append(emb.to('cuda', non_blocking=True))
 
         return emb
 
@@ -108,12 +110,12 @@ class SparseAdam(nn.Module):
     def step(self):
         with torch.no_grad():
             for param in self._params:
-                for trace in param.traces:
-                    ids = trace[0]
-                    grads = trace[1].grad.data
-                    self.update(ids, grads, param)
+                ids = torch.cat(param.ids_traces)
+                grads = torch.cat([i.grad.data for i in param.emb_traces])
+                self.update(ids, grads, param)
 
-            param.traces.clear()
+            param.ids_traces.clear()
+            param.emb_traces.clear()
 
 
 class SparseAdagrad(nn.Module):
@@ -159,9 +161,9 @@ class SparseAdagrad(nn.Module):
     def step(self):
         with torch.no_grad():
             for param in self._params:
-                for trace in param.traces:
-                    ids = trace[0]
-                    grads = trace[1].grad.data
-                    self.update(ids, grads, param)
+                ids = torch.cat(param.ids_traces)
+                grads = torch.cat([i.grad.data for i in param.emb_traces])
+                self.update(ids, grads, param)
 
-            param.traces.clear()
+            param.ids_traces.clear()
+            param.emb_traces.clear()
