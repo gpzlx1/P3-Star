@@ -39,16 +39,18 @@ def main(args, dataset):
 
     # set model
     if args.model == "sage":
+        hidden_size = args.hidden_size
         local_model, global_model = create_sage_p3(local_embedding_size,
                                                    args.hidden_size,
                                                    dataset['num_classes'],
                                                    args.num_layers)
     elif args.model == "gat":
+        hidden_size = args.hidden_size * args.heads[0]
         local_model, global_model = create_gat_p3(local_embedding_size,
                                                   args.hidden_size,
                                                   dataset['num_classes'],
                                                   args.num_layers,
-                                                  num_heads=args.num_heads)
+                                                  heads=args.heads)
 
     local_model = local_model.cuda()
     global_model = global_model.cuda()
@@ -76,24 +78,27 @@ def main(args, dataset):
 
     trainer = P3Trainer(embedding_feature, local_model, global_model,
                         emb_optimizer, local_optimizer, global_optimizer,
-                        F.cross_entropy, args.hidden_size,
+                        F.cross_entropy, hidden_size,
                         dataset['csc_indptr'].tensor_.dtype)
 
     # train
-    trainer.train_one_epoch(dataloader, labels)
+    for i in range(10):
+        trainer.train_one_epoch(dataloader, labels)
 
-    # inference
-    test_dataloader = dgl.dataloading.DataLoader(g,
-                                                 test_nids,
-                                                 sampler,
-                                                 batch_size=args.batch_size,
-                                                 shuffle=True,
-                                                 drop_last=False,
-                                                 use_ddp=True,
-                                                 use_uva=True)
-    acc = trainer.inference(test_dataloader, labels, dataset['num_classes'])
-    if nccl_rank == 0:
-        print(acc)
+        # inference
+        test_dataloader = dgl.dataloading.DataLoader(
+            g,
+            test_nids,
+            sampler,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=False,
+            use_ddp=True,
+            use_uva=True)
+        acc = trainer.inference(test_dataloader, labels,
+                                dataset['num_classes'])
+        if nccl_rank == 0:
+            print(acc)
 
 
 if __name__ == '__main__':
@@ -113,7 +118,7 @@ if __name__ == '__main__':
                         type=int,
                         help='Size of a hidden feature')
     parser.add_argument('--batch-size',
-                        default=1024,
+                        default=1000,
                         type=int,
                         help='Input batch size on each device (default: 1024)')
     parser.add_argument('--model',
@@ -121,18 +126,18 @@ if __name__ == '__main__':
                         type=str,
                         help='Model type: sage or gat',
                         choices=['sage', 'gat'])
-    parser.add_argument('--num_heads',
-                        default=4,
-                        type=int,
-                        help='Number of heads for GAT model')
+    parser.add_argument("--heads", type=str, default="8,8,1")
     parser.add_argument('--num-layers', default=3, type=int)
-    parser.add_argument('--lr', default=0.001, type=float)
-    parser.add_argument('--sparse-lr', default=0.01, type=float)
-    parser.add_argument('--fanouts', default="10, 10, 10", type=str)
-    parser.add_argument('--dropout', default=0.5, type=float)
+    parser.add_argument('--lr', default=0.003, type=float)
+    parser.add_argument('--sparse-lr', default=1e-2, type=float)
+    parser.add_argument('--fanouts', default="5, 10, 15", type=str)
     args = parser.parse_args()
     print(args)
     args.fanouts = [int(i) for i in args.fanouts.split(',')]
+    args.heads = [int(i) for i in args.heads.split(',')]
+
+    if args.model == 'gat':
+        args.hidden_size = args.hidden_size // args.heads[0]
 
     # init group
     dist.init_process_group('nccl', init_method='env://')

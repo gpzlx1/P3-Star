@@ -96,11 +96,19 @@ class GatP3Shuffle(torch.autograd.Function):
 
 class GatP3First(nn.Module):
 
-    def __init__(self, in_feats: int, hid_feats: int, num_heads: int):
+    def __init__(self,
+                 in_feats: int,
+                 hid_feats: int,
+                 num_heads: int,
+                 feat_dropout=0.1,
+                 attn_dropout=0.1):
         super().__init__()
         self.conv = GATConv(in_feats=in_feats,
-                            out_feats=int(hid_feats / num_heads),
-                            num_heads=num_heads)
+                            out_feats=hid_feats,
+                            num_heads=num_heads,
+                            feat_drop=feat_dropout,
+                            attn_drop=attn_dropout,
+                            allow_zero_in_degree=True)
 
     def forward(self, block, feat):
         return self.conv(block, feat).flatten(1)
@@ -113,7 +121,7 @@ class GatP3(nn.Module):
                  hid_feats: int,
                  num_layers: int,
                  out_feats: int,
-                 num_heads=[8, 8, 1],
+                 heads=[8, 8, 1],
                  activation=nn.functional.relu,
                  feat_dropout=0.1,
                  attn_dropout=0.1):
@@ -121,29 +129,31 @@ class GatP3(nn.Module):
         self.activation = activation
         self.layers = nn.ModuleList()
         for layer_idx in range(num_layers):
-            in_dim = in_feats if layer_idx == 0 else hid_feats * num_heads[
+            if layer_idx == 0:
+                continue
+
+            in_dim = in_feats if layer_idx == 0 else hid_feats * heads[
                 layer_idx - 1]
             out_dim = out_feats if layer_idx == num_layers - 1 else hid_feats
             layer_activation = None if layer_idx == num_layers - 1 else activation
 
-            if layer_idx == 0:
-                continue
-            else:
-                self.layers.append(
-                    GATConv(in_dim,
-                            out_dim,
-                            num_heads[layer_idx],
-                            feat_drop=feat_dropout,
-                            attn_drop=attn_dropout,
-                            activation=layer_activation,
-                            allow_zero_in_degree=True))
+            self.layers.append(
+                GATConv(in_dim,
+                        out_dim,
+                        heads[layer_idx],
+                        feat_drop=feat_dropout,
+                        attn_drop=attn_dropout,
+                        activation=layer_activation,
+                        allow_zero_in_degree=True))
+
+        self.activation = activation
         self.hid_feats_lst = []
 
     def forward(self, blocks, feat):
-        hid_feats = feat
+        hid_feats = self.activation(feat)
         for layer_idx, (layer, block) in enumerate(zip(self.layers, blocks)):
             hid_feats = layer(block, hid_feats)
-            if layer_idx != len(self.layers) - 1:
+            if layer_idx == len(self.layers) - 1:
                 hid_feats = hid_feats.mean(1)
             else:
                 hid_feats = hid_feats.flatten(1)
@@ -154,12 +164,12 @@ def create_gat_p3(in_feats: int,
                   hid_feats: int,
                   num_classes: int,
                   num_layers: int,
-                  num_heads: int = 4) -> tuple[nn.Module, nn.Module]:
+                  heads: int = 4) -> tuple[nn.Module, nn.Module]:
     first_layer = GatP3First(in_feats, hid_feats,
-                             num_heads)  # Intra-Model Parallel
+                             heads[0])  # Intra-Model Parallel
     remain_layers = GatP3(in_feats,
                           hid_feats,
                           num_layers,
                           num_classes,
-                          num_heads=num_heads)  # Data Parallel
+                          heads=heads)  # Data Parallel
     return (first_layer, remain_layers)

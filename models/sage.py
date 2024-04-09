@@ -138,7 +138,10 @@ class SageP3(nn.Module):
                              aggregator_type='mean'))
 
     def forward(self, blocks, feat):
-        hid_feats = feat
+        # do dropout and activate for first_layer
+        hid_feats = self.activation(feat)
+        hid_feats = self.dropout(hid_feats)
+
         for layer_idx, (layer, block) in enumerate(zip(self.layers, blocks)):
             hid_feats = layer(block, hid_feats)
             if layer_idx != len(self.layers) - 1:
