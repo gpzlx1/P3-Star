@@ -111,3 +111,54 @@ class SparseAdam(nn.Module):
                     self.update(ids, grads, param)
 
             param.traces.clear()
+
+
+class SparseAdagrad(nn.Module):
+
+    def __init__(self, params, lr, eps=1e-10):
+        super().__init__()
+
+        self._params = params
+        self._eps = eps
+        self._lr = lr
+        self._state = {}
+
+        for param in params:
+            state = torch.zeros((param.num_embeddings, param.embedding_dim),
+                                dtype=torch.float32)
+            self._state[param.name] = state
+
+    def update(self, idx, grad, emb):
+        eps = self._eps
+        clr = self._lr
+        state = self._state[emb.name]
+
+        # unique first
+        grad_indices, grad_values = unique_grads(idx, grad)
+
+        state_idx = grad_indices.cpu()
+        state_value = state[state_idx]
+        state_value = state_value.cuda()
+
+        grad_sum = grad_values * grad_values
+        state_value += grad_sum
+
+        state[state_idx] = state_value.cpu()
+
+        std_values = state_value.sqrt_().add_(eps)
+        tmp = clr * grad_values / std_values
+
+        emb.tensor[state_idx] -= tmp.cpu()
+
+    def zero_grad(self):
+        self._clean_grad = True
+
+    def step(self):
+        with torch.no_grad():
+            for param in self._params:
+                for trace in param.traces:
+                    ids = trace[0]
+                    grads = trace[1].grad.data
+                    self.update(ids, grads, param)
+
+            param.traces.clear()
