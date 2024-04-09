@@ -18,6 +18,9 @@ class Embedding(nn.Module):
     def forward(self, ids):
         emb = self.tensor[ids].cuda()
 
+        if not self.training:
+            return emb
+
         emb.requires_grad_(True)
         emb.retain_grad()
 

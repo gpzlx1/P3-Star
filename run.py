@@ -13,6 +13,7 @@ import tqdm
 import torch.nn.functional as F
 import torchmetrics as MF
 from embedding import Embedding, SparseAdam
+from trainer import P3Trainer
 
 
 def main(args, dataset):
@@ -35,17 +36,6 @@ def main(args, dataset):
     g = dgl.graph(
         ('csr', (dataset['csc_indptr'].tensor_, dataset['csc_indices'].tensor_,
                  torch.Tensor())))
-
-    # set dataloader
-    sampler = dgl.dataloading.NeighborSampler(args.fanouts)
-    dataloader = dgl.dataloading.DataLoader(g,
-                                            train_nids,
-                                            sampler,
-                                            batch_size=args.batch_size,
-                                            shuffle=True,
-                                            drop_last=False,
-                                            use_ddp=True,
-                                            use_uva=True)
 
     # set model
     if args.model == "sage":
@@ -72,124 +62,27 @@ def main(args, dataset):
     local_optimizer = torch.optim.Adam(local_model.parameters(), lr=args.lr)
     emb_optimizer = SparseAdam((embedding_feature, ), lr=args.sparse_lr)
 
-    # begin training
-    est_node_size = args.batch_size * 20
-    edge_size_lst = [(0, 0, 0, 0)] * nccl_world_size
-    input_node_buffer_lst = []
-    src_edge_buffer_lst = []
-    dst_edge_buffer_lst = []
-    global_grad_lst = []
-    input_feat_buffer_lst = []
-    for _ in range(nccl_world_size):
-        input_node_buffer_lst.append(
-            torch.empty(est_node_size,
-                        dtype=dataset['csc_indptr'].tensor_.dtype,
-                        device='cuda'))
-        src_edge_buffer_lst.append(
-            torch.empty(est_node_size,
-                        dtype=dataset['csc_indptr'].tensor_.dtype,
-                        device='cuda'))
-        dst_edge_buffer_lst.append(
-            torch.empty(est_node_size,
-                        dtype=dataset['csc_indptr'].tensor_.dtype,
-                        device='cuda'))
-        global_grad_lst.append(
-            torch.empty((est_node_size, args.hidden_size),
-                        dtype=torch.float32,
-                        device='cuda'))
-        input_feat_buffer_lst.append(
-            torch.empty((est_node_size, args.hidden_size),
-                        dtype=torch.float32,
-                        device='cuda'))
-    local_hid_buffer_lst: list[torch.Tensor] = [None] * nccl_world_size
+    # train
+    # set dataloader
+    sampler = dgl.dataloading.NeighborSampler(args.fanouts)
+    dataloader = dgl.dataloading.DataLoader(g,
+                                            train_nids,
+                                            sampler,
+                                            batch_size=args.batch_size,
+                                            shuffle=True,
+                                            drop_last=False,
+                                            use_ddp=True,
+                                            use_uva=True)
 
-    print('begin training')
+    trainer = P3Trainer(embedding_feature, local_model, global_model,
+                        emb_optimizer, local_optimizer, global_optimizer,
+                        F.cross_entropy, args.hidden_size,
+                        dataset['csc_indptr'].tensor_.dtype)
 
-    # for one epoch
-    begin = time.time()
-    for i, (input_nodes, output_nodes,
-            blocks) in enumerate(tqdm.tqdm(dataloader, disable=nccl_rank
-                                           != 0)):
-        top_block = blocks[0]
+    # train
+    trainer.train_one_epoch(dataloader, labels)
 
-        src, dst = top_block.adj_tensors('coo')
-        edge_size_lst[nccl_rank] = (nccl_rank, src.shape[0],
-                                    top_block.num_src_nodes(),
-                                    top_block.num_dst_nodes())
-
-        dist.all_gather_object(object_list=edge_size_lst,
-                               obj=edge_size_lst[nccl_rank])
-
-        for rank, edge_size, src_node_size, dst_node_size in edge_size_lst:
-            src_edge_buffer_lst[rank].resize_(edge_size)
-            dst_edge_buffer_lst[rank].resize_(edge_size)
-            input_node_buffer_lst[rank].resize_(src_node_size)
-
-        handle1 = dist.all_gather(tensor_list=input_node_buffer_lst,
-                                  tensor=input_nodes,
-                                  async_op=True)
-        handle2 = dist.all_gather(tensor_list=src_edge_buffer_lst,
-                                  tensor=src,
-                                  async_op=True)
-        handle3 = dist.all_gather(tensor_list=dst_edge_buffer_lst,
-                                  tensor=dst,
-                                  async_op=True)
-        handle1.wait()
-
-        for rank, _input_nodes in enumerate(input_node_buffer_lst):
-            input_feat_buffer_lst[rank] = embedding_feature(
-                _input_nodes.cpu()).cuda()
-
-        handle2.wait()
-        handle3.wait()
-
-        block = None
-        for r in range(nccl_world_size):
-            input_nodes = input_node_buffer_lst[r]
-            input_feats = input_feat_buffer_lst[r]
-            if r == nccl_rank:
-                block = top_block
-            else:
-                src = src_edge_buffer_lst[r]
-                dst = dst_edge_buffer_lst[r]
-                src_node_size = edge_size_lst[r][2]
-                dst_node_size = edge_size_lst[r][3]
-                block = create_block(('coo', (src, dst)),
-                                     num_dst_nodes=dst_node_size,
-                                     num_src_nodes=src_node_size,
-                                     device='cuda')
-
-            local_hid_buffer_lst[r] = local_model(block, input_feats)
-            global_grad_lst[r].resize_(
-                [block.num_dst_nodes(), args.hidden_size])
-
-        local_hid = SageP3Shuffle.apply(nccl_rank, nccl_world_size,
-                                        local_hid_buffer_lst[nccl_rank],
-                                        local_hid_buffer_lst, global_grad_lst)
-        output_labels = labels[output_nodes.cpu()].cuda()
-        output_pred = global_model(blocks[1:], local_hid)
-        loss = F.cross_entropy(output_pred, output_labels)
-
-        global_optimizer.zero_grad()
-        local_optimizer.zero_grad()
-        loss.backward()
-        global_optimizer.step()
-
-        # embedding
-
-        for r, global_grad in enumerate(global_grad_lst):
-            if r != nccl_rank:
-                local_optimizer.zero_grad()
-                local_hid_buffer_lst[r].backward(global_grad)
-
-        local_optimizer.step()
-        emb_optimizer.zero_grad()
-        emb_optimizer.step()
-
-    # end = time.time()
-
-    # print(end - begin)
-
+    # inference
     test_dataloader = dgl.dataloading.DataLoader(g,
                                                  test_nids,
                                                  sampler,
@@ -198,83 +91,9 @@ def main(args, dataset):
                                                  drop_last=False,
                                                  use_ddp=True,
                                                  use_uva=True)
-
-    # inference
-    if True:
-        global_model.eval()
-        local_model.eval()
-
-        ys = []
-        y_hats = []
-        for it, (input_nodes, output_nodes, blocks) in enumerate(
-                tqdm.tqdm(test_dataloader, disable=nccl_rank != 0)):
-            with torch.no_grad():
-                top_block = blocks[0]
-                # 1. Send and Receive edges for all the other gpus
-                src, dst = top_block.adj_tensors('coo')  # dgl v1.1 and above
-                # src, dst = top_block.adj_sparse(fmt='coo') # dgl v1.0 and below
-                edge_size_lst[nccl_rank] = (
-                    nccl_rank, src.shape[0], top_block.num_src_nodes(),
-                    top_block.num_dst_nodes()
-                )  # rank, edge_size, input_node_size
-                dist.all_gather_object(object_list=edge_size_lst,
-                                       obj=edge_size_lst[nccl_rank])
-                for rank, edge_size, src_node_size, dst_node_size in edge_size_lst:
-                    src_edge_buffer_lst[rank].resize_(edge_size)
-                    dst_edge_buffer_lst[rank].resize_(edge_size)
-                    input_node_buffer_lst[rank].resize_(src_node_size)
-                    # input_feat_buffer_lst[rank].resize_([src_node_size, local_feat_width])
-                # dist.barrier()
-                handle1 = dist.all_gather(tensor_list=input_node_buffer_lst,
-                                          tensor=input_nodes,
-                                          async_op=True)
-                handle2 = dist.all_gather(tensor_list=src_edge_buffer_lst,
-                                          tensor=src,
-                                          async_op=True)
-                handle3 = dist.all_gather(tensor_list=dst_edge_buffer_lst,
-                                          tensor=dst,
-                                          async_op=True)
-                handle1.wait()
-                for rank, _input_nodes in enumerate(input_node_buffer_lst):
-                    input_feat_buffer_lst[rank] = embedding_feature(
-                        _input_nodes.to('cpu')).cuda()
-                handle2.wait()
-                handle3.wait()
-                # 3. Fetch feature data and compute hid feature for other GPUs
-                block = None
-                for r in range(nccl_world_size):
-                    input_nodes = input_node_buffer_lst[r]
-                    input_feats = input_feat_buffer_lst[r]
-                    if r == nccl_rank:
-                        block = top_block
-                    else:
-                        src = src_edge_buffer_lst[r]
-                        dst = dst_edge_buffer_lst[r]
-                        src_node_size = edge_size_lst[r][2]
-                        dst_node_size = edge_size_lst[r][3]
-                        block = create_block(('coo', (src, dst)),
-                                             num_dst_nodes=dst_node_size,
-                                             num_src_nodes=src_node_size,
-                                             device='cuda')
-
-                    local_hid_buffer_lst[r] = local_model(block, input_feats)
-                    # global_grad_lst[r].resize_([block.num_dst_nodes(), hid_feats])
-                    del block
-
-                local_hid = SageP3Shuffle.apply(
-                    nccl_rank, nccl_world_size,
-                    local_hid_buffer_lst[nccl_rank], local_hid_buffer_lst,
-                    None)
-                ys.append(labels[output_nodes.cpu()].cpu())
-                y_hats.append(global_model(blocks[1:], local_hid).cpu())
-
-        acc = MF.Accuracy(task="multiclass",
-                          num_classes=dataset['num_classes'])
-        acc = acc(torch.cat(y_hats), torch.cat(ys)).cuda()
-
-        dist.all_reduce(acc, op=dist.ReduceOp.SUM)
-        if nccl_rank == 0:
-            print((acc / nccl_world_size).item())
+    acc = trainer.inference(test_dataloader, labels, dataset['num_classes'])
+    if nccl_rank == 0:
+        print(acc)
 
 
 if __name__ == '__main__':
