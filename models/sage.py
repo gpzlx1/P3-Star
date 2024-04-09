@@ -7,15 +7,17 @@ import torch.distributed as dist
 
 class Sage(nn.Module):
 
-    def __init__(self, in_feats: int, hid_feats: int, num_layers: int,
-                 out_feats: int):
+    def __init__(self,
+                 in_feats: int,
+                 hid_feats: int,
+                 num_layers: int,
+                 out_feats: int,
+                 activation=nn.functional.relu,
+                 dropout: float = 0.5):
         super().__init__()
-        self.activation = nn.ReLU()
-        self.dropout = nn.Dropout()
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout)
         self.layers = nn.ModuleList()
-        self.fwd_l1_timer = []
-        self.hid_feats_lst = []
-
         for layer_idx in range(num_layers):
             if layer_idx == 0:
                 self.layers.append(
@@ -33,6 +35,8 @@ class Sage(nn.Module):
                     SAGEConv(in_feats=hid_feats,
                              out_feats=out_feats,
                              aggregator_type='mean'))
+        self.fwd_l1_timer = []
+        self.hid_feats_lst = []
 
     def forward(self, blocks, feat):
         hid_feats = feat
@@ -104,11 +108,16 @@ class SageP3Shuffle(torch.autograd.Function):
 
 class SageP3(nn.Module):
 
-    def __init__(self, in_feats: int, hid_feats: int, num_layers: int,
-                 out_feats: int):
+    def __init__(self,
+                 in_feats: int,
+                 hid_feats: int,
+                 num_layers: int,
+                 out_feats: int,
+                 activation=nn.functional.relu,
+                 dropout: float = 0.5):
         super().__init__()
-        self.activation = nn.ReLU()
-        self.dropout = nn.Dropout()
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout)
         self.layers = nn.ModuleList()
         for layer_idx in range(num_layers):
             if layer_idx == 0:

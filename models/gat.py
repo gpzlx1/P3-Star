@@ -12,31 +12,28 @@ class Gat(nn.Module):
                  hid_feats: int,
                  num_layers: int,
                  out_feats: int,
-                 num_heads: int = 4):
+                 num_heads=[8, 8, 1],
+                 activation=nn.functional.relu,
+                 feat_dropout=0.1,
+                 attn_dropout=0.1):
         super().__init__()
-        self.activation = nn.ReLU()
-        self.dropout = nn.Dropout()
+        self.activation = activation
         self.layers = nn.ModuleList()
+        for layer_idx in range(num_layers):
+            in_dim = in_feats if layer_idx == 0 else hid_feats * num_heads[
+                layer_idx - 1]
+            out_dim = out_feats if layer_idx == num_layers - 1 else hid_feats
+            layer_activation = None if layer_idx == num_layers - 1 else activation
+            self.layers.append(
+                GATConv(in_dim,
+                        out_dim,
+                        num_heads[layer_idx],
+                        feat_drop=feat_dropout,
+                        attn_drop=attn_dropout,
+                        activation=layer_activation,
+                        allow_zero_in_degree=True))
         self.fwd_l1_timer = []
         self.hid_feats_lst = []
-        hid_feats = int(hid_feats / num_heads)
-        for layer_idx in range(num_layers):
-            if layer_idx == 0:
-                self.layers.append(
-                    GATConv(in_feats=in_feats,
-                            out_feats=hid_feats,
-                            num_heads=num_heads))
-            elif layer_idx >= 1 and layer_idx < num_layers - 1:
-                self.layers.append(
-                    GATConv(in_feats=hid_feats * num_heads,
-                            out_feats=hid_feats,
-                            num_heads=num_heads))
-            else:
-                # last layer
-                self.layers.append(
-                    GATConv(in_feats=hid_feats * num_heads,
-                            out_feats=out_feats,
-                            num_heads=1))
 
     def forward(self, blocks, feat):
         hid_feats = feat
@@ -49,9 +46,9 @@ class Gat(nn.Module):
                 l1_end.record()
                 self.fwd_l1_timer.append((l1_start, l1_end))
             if layer_idx != len(self.layers) - 1:
-                hid_feats = self.activation(hid_feats)
-                hid_feats = self.dropout(hid_feats)
-            hid_feats = hid_feats.flatten(1)
+                hid_feats = hid_feats.mean(1)
+            else:
+                hid_feats = hid_feats.flatten(1)
         return hid_feats
 
     def fwd_l1_time(self):
@@ -116,36 +113,40 @@ class GatP3(nn.Module):
                  hid_feats: int,
                  num_layers: int,
                  out_feats: int,
-                 num_heads: int = 4):
+                 num_heads=[8, 8, 1],
+                 activation=nn.functional.relu,
+                 feat_dropout=0.1,
+                 attn_dropout=0.1):
         super().__init__()
-        self.activation = nn.ReLU()
-        self.dropout = nn.Dropout()
+        self.activation = activation
         self.layers = nn.ModuleList()
-        self.hid_feats_lst = []
-        hid_feats = int(hid_feats / num_heads)
         for layer_idx in range(num_layers):
+            in_dim = in_feats if layer_idx == 0 else hid_feats * num_heads[
+                layer_idx - 1]
+            out_dim = out_feats if layer_idx == num_layers - 1 else hid_feats
+            layer_activation = None if layer_idx == num_layers - 1 else activation
+
             if layer_idx == 0:
                 continue
-            elif layer_idx >= 1 and layer_idx < num_layers - 1:
-                self.layers.append(
-                    GATConv(in_feats=hid_feats * num_heads,
-                            out_feats=hid_feats,
-                            num_heads=num_heads))
             else:
-                # last layer
                 self.layers.append(
-                    GATConv(in_feats=hid_feats * num_heads,
-                            out_feats=out_feats,
-                            num_heads=1))
+                    GATConv(in_dim,
+                            out_dim,
+                            num_heads[layer_idx],
+                            feat_drop=feat_dropout,
+                            attn_drop=attn_dropout,
+                            activation=layer_activation,
+                            allow_zero_in_degree=True))
+        self.hid_feats_lst = []
 
     def forward(self, blocks, feat):
         hid_feats = feat
         for layer_idx, (layer, block) in enumerate(zip(self.layers, blocks)):
             hid_feats = layer(block, hid_feats)
             if layer_idx != len(self.layers) - 1:
-                hid_feats = self.activation(hid_feats)
-                hid_feats = self.dropout(hid_feats)
-            hid_feats = hid_feats.flatten(1)
+                hid_feats = hid_feats.mean(1)
+            else:
+                hid_feats = hid_feats.flatten(1)
         return hid_feats
 
 
