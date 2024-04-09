@@ -6,6 +6,7 @@ from dgl import create_block
 from models.sage import SageP3Shuffle
 import torch.nn.functional as F
 import torchmetrics as MF
+import time
 
 
 class P3Trainer:
@@ -50,12 +51,26 @@ class P3Trainer:
         self.local_hid_buffer_lst: list[torch.Tensor] = [None
                                                          ] * self.world_size
 
+        self.emb_layer.tensor = self.emb_layer.tensor.cuda()
+
+        self.log = {}
+        for i in range(10):
+            self.log['step' + str(i)] = []
+
     def train_one_epoch(self, dataloader, labels):
         self.emb_layer.train()
         self.first_layer.train()
         self.other_layer.train()
+
+        begin = time.time()
+
         for i, (input_nodes, output_nodes, blocks) in enumerate(
                 tqdm.tqdm(dataloader, disable=self.rank != 0)):
+
+            torch.cuda.synchronize()
+            self.log['step0'].append(time.time() - begin)
+            begin = time.time()
+
             top_block = blocks[0]
 
             src, dst = top_block.adj_tensors('coo')
@@ -63,13 +78,24 @@ class P3Trainer:
                                              top_block.num_src_nodes(),
                                              top_block.num_dst_nodes())
 
+            torch.cuda.synchronize()
+            self.log['step1'].append(time.time() - begin)
+            begin = time.time()
+
             dist.all_gather_object(object_list=self.edge_size_lst,
                                    obj=self.edge_size_lst[self.rank])
+
+            torch.cuda.synchronize()
+            self.log['step2'].append(time.time() - begin)
+            begin = time.time()
 
             for rank, edge_size, src_node_size, dst_node_size in self.edge_size_lst:
                 self.src_edge_buffer_lst[rank].resize_(edge_size)
                 self.dst_edge_buffer_lst[rank].resize_(edge_size)
                 self.input_node_buffer_lst[rank].resize_(src_node_size)
+            torch.cuda.synchronize()
+            self.log['step3'].append(time.time() - begin)
+            begin = time.time()
 
             handle1 = dist.all_gather(tensor_list=self.input_node_buffer_lst,
                                       tensor=input_nodes,
@@ -80,14 +106,26 @@ class P3Trainer:
             handle3 = dist.all_gather(tensor_list=self.dst_edge_buffer_lst,
                                       tensor=dst,
                                       async_op=True)
+            torch.cuda.synchronize()
+            self.log['step4'].append(time.time() - begin)
+            begin = time.time()
+
             handle1.wait()
 
             for rank, _input_nodes in enumerate(self.input_node_buffer_lst):
                 self.input_feat_buffer_lst[rank] = self.emb_layer(
-                    _input_nodes.cpu()).cuda()
+                    _input_nodes).cuda()
+
+            torch.cuda.synchronize()
+            self.log['step5'].append(time.time() - begin)
+            begin = time.time()
 
             handle2.wait()
             handle3.wait()
+
+            torch.cuda.synchronize()
+            self.log['step6'].append(time.time() - begin)
+            begin = time.time()
 
             block = None
             for r in range(self.world_size):
@@ -110,6 +148,10 @@ class P3Trainer:
                 self.global_grad_lst[r].resize_(
                     [block.num_dst_nodes(), self.hidden_size])
 
+            torch.cuda.synchronize()
+            self.log['step7'].append(time.time() - begin)
+            begin = time.time()
+
             local_hid = SageP3Shuffle.apply(
                 self.rank, self.world_size,
                 self.local_hid_buffer_lst[self.rank],
@@ -118,21 +160,35 @@ class P3Trainer:
             output_pred = self.other_layer(blocks[1:], local_hid)
             loss = F.cross_entropy(output_pred, output_labels)
 
-            self.other_optimizer.zero_grad()
-            self.first_optimizer.zero_grad()
-            loss.backward()
-            self.other_optimizer.step()
+            torch.cuda.synchronize()
+            self.log['step8'].append(time.time() - begin)
+            begin = time.time()
 
-            # embedding
+            self.emb_optimizer.zero_grad()
+            self.first_optimizer.zero_grad()
+            self.other_optimizer.zero_grad()
+
+            loss.backward()
 
             for r, global_grad in enumerate(self.global_grad_lst):
                 if r != self.rank:
-                    self.first_layer.zero_grad()
                     self.local_hid_buffer_lst[r].backward(global_grad)
 
-            self.first_optimizer.step()
-            self.emb_optimizer.zero_grad()
             self.emb_optimizer.step()
+            self.first_optimizer.step()
+            self.other_optimizer.step()
+
+            torch.cuda.synchronize()
+            self.log['step9'].append(time.time() - begin)
+            begin = time.time()
+
+        for key, value in self.log.items():
+            value = torch.tensor(value[2:]).cuda()
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+            if self.rank == 0:
+                print(key, value.mean().item() * 1000 / self.world_size)
+
+            self.log[key].clear()
 
     def inference(self, dataloader, labels, num_classes):
         self.emb_layer.eval()
