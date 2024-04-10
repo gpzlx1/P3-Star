@@ -54,5 +54,33 @@ def process_reddit(save_path, save_feat=False):
         np.save(os.path.join(save_path, 'features'), features.numpy())
 
 
+def process_products(root, save_path, save_feat=False):
+    from ogb.nodeproppred import DglNodePropPredDataset
+    data = DglNodePropPredDataset(name="ogbn-products", root=root)
+    dgl_graph, labels = data[0]
+    splitted_idx = data.get_idx_split()
+
+    csc = dgl_graph.adj_tensors('csc')
+    indptr, indices, _ = csc
+    train_nids = splitted_idx["train"]
+    valid_nids = splitted_idx["valid"]
+    test_nids = splitted_idx["test"]
+    labels = labels[:, 0]
+
+    if save_feat:
+        features = dgl_graph.ndata['feat']
+
+    np.save(os.path.join(save_path, 'csc_indptr'), indptr.numpy())
+    np.save(os.path.join(save_path, 'csc_indices'), indices.numpy())
+    np.save(os.path.join(save_path, 'train_nids'), train_nids.numpy())
+    np.save(os.path.join(save_path, 'valid_nids'), valid_nids.numpy())
+    np.save(os.path.join(save_path, 'test_nids'), test_nids.numpy())
+    np.save(os.path.join(save_path, 'labels'), labels.numpy())
+
+    if save_feat:
+        np.save(os.path.join(save_path, 'features'), features.numpy())
+
+
 if __name__ == '__main__':
-    process_reddit('./datasets', save_feat=True)
+    # process_reddit('./datasets', save_feat=True)
+    process_products("/data", "./datasets", save_feat=True)
