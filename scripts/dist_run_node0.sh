@@ -1,0 +1,1 @@
+OMP_NUM_THREADS=8 torchrun --nproc_per_node 8 --master_port 12345 --nnodes 4 --node_rank 0 --master_addr 172.31.20.34 run.py --load-path datasets/papers --model sage --num-trainers 8 --total-epochs 20
