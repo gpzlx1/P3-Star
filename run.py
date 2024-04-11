@@ -10,6 +10,7 @@ import numpy as np
 import torch.nn.functional as F
 from embedding import Embedding, SparseAdam
 from trainer import P3Trainer
+from shmtensor import GPUSamplingDataloader
 
 
 def main(args, dataset):
@@ -34,9 +35,6 @@ def main(args, dataset):
     train_nids = dataset['train_nids'].tensor_
     test_nids = dataset['test_nids'].tensor_
     valid_nids = dataset['valid_nids'].tensor_
-    g = dgl.graph(
-        ('csr', (dataset['csc_indptr'].tensor_, dataset['csc_indices'].tensor_,
-                 torch.Tensor())))
 
     # set model
     if nccl_rank == 0:
@@ -72,17 +70,15 @@ def main(args, dataset):
     # train
     # set dataloader
     if nccl_rank == 0:
-        print("Create dgl sampler and dataloader")
-    sampler = dgl.dataloading.NeighborSampler(args.fanouts)
-    dataloader = dgl.dataloading.DataLoader(g,
-                                            train_nids,
-                                            sampler,
-                                            device="cuda",
-                                            batch_size=args.batch_size,
-                                            shuffle=True,
-                                            drop_last=False,
-                                            use_ddp=True,
-                                            use_uva=True)
+        print("Create gpu sampling dataloader")
+    dataloader = GPUSamplingDataloader(dataset['csc_indptr'].tensor_,
+                                       dataset['csc_indices'].tensor_,
+                                       train_nids,
+                                       args.batch_size,
+                                       args.fanouts,
+                                       shuffle=True,
+                                       drop_last=False,
+                                       use_ddp=True)
 
     if nccl_rank == 0:
         print("Create p3 trainer")
@@ -97,6 +93,7 @@ def main(args, dataset):
     timelst = []
     for i in range(args.total_epochs):
         tic = time.time()
+        dataloader.update_params(seeds=train_nids)
         trainer.train_one_epoch(dataloader, labels)
         toc = time.time()
         epoch_time = toc - tic
@@ -106,31 +103,26 @@ def main(args, dataset):
         timelst.append(epoch_time)
 
         # inference
-        test_dataloader = dgl.dataloading.DataLoader(
-            g,
-            test_nids,
-            sampler,
-            batch_size=args.batch_size,
-            shuffle=True,
-            drop_last=False,
-            use_ddp=True,
-            use_uva=True)
-        test_acc = trainer.inference(test_dataloader, labels,
+        dataloader.update_params(seeds=test_nids)
+        test_acc = trainer.inference(dataloader, labels,
                                      dataset['num_classes'])
-        valid_dataloader = dgl.dataloading.DataLoader(
-            g,
-            valid_nids,
-            sampler,
-            batch_size=args.batch_size,
-            shuffle=True,
-            drop_last=False,
-            use_ddp=True,
-            use_uva=True)
-        valid_acc = trainer.inference(valid_dataloader, labels,
+
+        dataloader.update_params(seeds=valid_nids)
+        valid_acc = trainer.inference(dataloader, labels,
                                       dataset['num_classes'])
+
+        # reduce valid_acc, test_acc
+        valid_acc = torch.Tensor([valid_acc]).cuda()
+        dist.all_reduce(valid_acc, dist.ReduceOp.SUM)
+        test_acc = torch.Tensor([test_acc]).cuda()
+        dist.all_reduce(test_acc, dist.ReduceOp.SUM)
         if nccl_rank == 0:
             print("Epoch time: {:.3f} s, Valid acc: {:.3f}, Test acc: {:.3f}".
-                  format(epoch_time, valid_acc, test_acc))
+                  format(epoch_time,
+                         valid_acc.item() / dist.get_world_size(),
+                         test_acc.item() / dist.get_world_size()))
+
+    # reduce total epoch time
     if nccl_rank == 0:
         print("Avg epoch time: {:.3f} s".format(np.mean(timelst[1:])))
 
