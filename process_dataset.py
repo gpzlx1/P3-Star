@@ -1,32 +1,6 @@
 import dgl
 import torch
 import os
-import argparse
-import dgl
-import ogb
-import numpy as np
-
-
-def convert(dgl_graph: dgl.graph, save_feat: bool, path: str):
-    csc = dgl_graph.adj_tensors('csc')
-    indptr, indices, _ = csc
-    train_nids = dgl_graph.ndata['train_mask']
-    valid_nids = dgl_graph.ndata['test']
-    test_nids = dgl_graph.ndata['test']
-    labels = dgl_graph.ndata['labels']
-
-    if save_feat:
-        features = dgl_graph.ndata['features']
-
-    np.save(os.path.join(path, 'csc_indptr'), indptr.numpy())
-    np.save(os.path.join(path, 'csc_indices'), indices.numpy())
-    np.save(os.path.join(path, 'train_nids'), train_nids.numpy())
-    np.save(os.path.join(path, 'valid_nids'), valid_nids.numpy())
-    np.save(os.path.join(path, 'test_nids'), test_nids.numpy())
-    np.save(os.path.join(path, 'labels'), test_nids.numpy())
-
-    if save_feat:
-        np.save(os.path.join(path, 'features'), features.numpy())
 
 
 def process_reddit(save_path, save_feat=False):
@@ -43,15 +17,29 @@ def process_reddit(save_path, save_feat=False):
     if save_feat:
         features = dgl_graph.ndata['feat']
 
-    np.save(os.path.join(save_path, 'csc_indptr'), indptr.numpy())
-    np.save(os.path.join(save_path, 'csc_indices'), indices.numpy())
-    np.save(os.path.join(save_path, 'train_nids'), train_nids.numpy())
-    np.save(os.path.join(save_path, 'valid_nids'), valid_nids.numpy())
-    np.save(os.path.join(save_path, 'test_nids'), test_nids.numpy())
-    np.save(os.path.join(save_path, 'labels'), labels.numpy())
+    torch.save(indptr, os.path.join(save_path, 'csc_indptr.pt'))
+    torch.save(indices, os.path.join(save_path, 'csc_indices.pt'))
+    torch.save(train_nids, os.path.join(save_path, 'train_nids.pt'))
+    torch.save(valid_nids, os.path.join(save_path, 'valid_nids.pt'))
+    torch.save(test_nids, os.path.join(save_path, 'test_nids.pt'))
+    torch.save(labels, os.path.join(save_path, 'labels.pt'))
 
     if save_feat:
-        np.save(os.path.join(save_path, 'features'), features.numpy())
+        torch.save(features, os.path.join(save_path, 'features.pt'))
+
+    meta = {
+        "csc_indptr": (indptr.dtype, indptr.shape),
+        "csc_indices": (indices.dtype, indices.shape),
+        "train_nids": (train_nids.dtype, train_nids.shape),
+        "valid_nids": (valid_nids.dtype, valid_nids.shape),
+        "test_nids": (test_nids.dtype, test_nids.shape),
+        "labels": (labels.dtype, labels.shape)
+    }
+
+    if save_feat:
+        meta["features"] = (features.dtype, features.shape)
+
+    torch.save(meta, os.path.join(save_path, 'meta.pt'))
 
 
 def process_ogbn(name, root, save_path, save_feat=False):
@@ -70,20 +58,34 @@ def process_ogbn(name, root, save_path, save_feat=False):
     if save_feat:
         features = dgl_graph.ndata['feat']
 
-    np.save(os.path.join(save_path, 'csc_indptr'), indptr.numpy())
-    np.save(os.path.join(save_path, 'csc_indices'), indices.numpy())
-    np.save(os.path.join(save_path, 'train_nids'), train_nids.numpy())
-    np.save(os.path.join(save_path, 'valid_nids'), valid_nids.numpy())
-    np.save(os.path.join(save_path, 'test_nids'), test_nids.numpy())
-    np.save(os.path.join(save_path, 'labels'), labels.numpy())
+    torch.save(indptr, os.path.join(save_path, 'csc_indptr.pt'))
+    torch.save(indices, os.path.join(save_path, 'csc_indices.pt'))
+    torch.save(train_nids, os.path.join(save_path, 'train_nids.pt'))
+    torch.save(valid_nids, os.path.join(save_path, 'valid_nids.pt'))
+    torch.save(test_nids, os.path.join(save_path, 'test_nids.pt'))
+    torch.save(labels, os.path.join(save_path, 'labels.pt'))
 
     if save_feat:
-        np.save(os.path.join(save_path, 'features'), features.numpy())
+        torch.save(features, os.path.join(save_path, 'features.pt'))
+
+    meta = {
+        "csc_indptr": (indptr.dtype, indptr.shape),
+        "csc_indices": (indices.dtype, indices.shape),
+        "train_nids": (train_nids.dtype, train_nids.shape),
+        "valid_nids": (valid_nids.dtype, valid_nids.shape),
+        "test_nids": (test_nids.dtype, test_nids.shape),
+        "labels": (labels.dtype, labels.shape)
+    }
+
+    if save_feat:
+        meta["features"] = (features.dtype, features.shape)
+
+    torch.save(meta, os.path.join(save_path, 'meta.pt'))
 
 
 if __name__ == '__main__':
-    # process_reddit('./datasets', save_feat=True)
-    process_ogbn("ogbn-papers100M",
-                 "/home/ubuntu/workspace/datasets",
-                 "./datasets/papers",
-                 save_feat=False)
+    process_reddit('./datasets', save_feat=False)
+    #process_ogbn("ogbn-papers100M",
+    #             "/home/ubuntu/workspace/datasets",
+    #             "./datasets/papers",
+    #             save_feat=False)

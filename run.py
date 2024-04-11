@@ -1,18 +1,13 @@
-import os
 import torch
 import dgl
-from load_dataset import load_dataset
+from load_dataset import dist_load_tensor
 import torch.distributed as dist
 import argparse
 from models.sage import create_sage_p3
-from models.sage import SageP3Shuffle
 from models.gat import create_gat_p3
 import time
-from dgl import create_block
-import tqdm
 import numpy as np
 import torch.nn.functional as F
-import torchmetrics as MF
 from embedding import Embedding, SparseAdam
 from trainer import P3Trainer
 
@@ -185,8 +180,10 @@ if __name__ == '__main__':
     ## set device
     torch.cuda.set_device(dist.get_rank() % args.num_trainers)
 
+    ## create local group
+
     print("load dataset")
-    dataset = load_dataset(args.load_path, pin_memory=False, with_feat=False)
+    dataset = dist_load_tensor(args.load_path)
     print("finish load dataset")
 
     main(args, dataset)

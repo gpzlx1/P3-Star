@@ -1,47 +1,68 @@
-import numpy as np
 import torch
-from shmtensor import DiskTensor
+from shmtensor import ShmTensor
 import os
+import torch.distributed as dist
 
 
-def load_dataset(load_path, pin_memory=False, with_feat=False):
-    csc_indptr = DiskTensor(os.path.join(load_path, 'csc_indptr.npy'),
-                            pin_memory)
-    csc_indices = DiskTensor(os.path.join(load_path, 'csc_indices.npy'),
-                             pin_memory)
-    train_nids = DiskTensor(os.path.join(load_path, 'train_nids.npy'),
-                            pin_memory)
-    valid_nids = DiskTensor(os.path.join(load_path, 'valid_nids.npy'),
-                            pin_memory)
-    test_nids = DiskTensor(os.path.join(load_path, 'test_nids.npy'),
-                           pin_memory)
-    labels = DiskTensor(os.path.join(load_path, 'labels.npy'), pin_memory)
+def open_file(load_path, filename):
+    data = torch.load(os.path.join(load_path, filename))
+    return data
 
-    if with_feat:
-        features = DiskTensor(os.path.join(load_path, 'features.npy'),
-                              pin_memory)
-    else:
-        features = None
 
+def load_dataset(meta, load_path):
+    tensor_dict = {}
+    for key, value in meta.items():
+        tensor_dict[key] = open_file(load_path, key + ".pt")
+    return tensor_dict
+
+
+def create_shmtensor(meta, local_rank, world_size, cur_group):
+    new_tensor_dict = {}
+    for key, value in meta.items():
+        new_tensor_dict[key] = ShmTensor(key,
+                                         meta[key][1],
+                                         local_rank,
+                                         world_size,
+                                         cur_group,
+                                         dtype=meta[key][0])
+    return new_tensor_dict
+
+
+def assign_shmtensor(new_tensor_dict, tensor_dict, local_rank):
+    if local_rank == 0:
+        for key, value in new_tensor_dict.items():
+            new_tensor_dict[key].tensor_[:] = tensor_dict[key]
+
+
+def dist_load_tensor(load_path):
+    meta = torch.load(os.path.join(load_path, 'meta.pt'))
+    local_rank, local_world_size, local_group = create_local_group()
+    new_tensor_dict = create_shmtensor(meta, local_rank, local_world_size,
+                                       local_group)
+
+    if local_rank == 0:
+        tensor_dict = load_dataset(meta, load_path)
+    dist.barrier(local_group)
+
+    if local_rank == 0:
+        assign_shmtensor(new_tensor_dict, tensor_dict, local_rank)
+    dist.barrier(local_group)
+
+    labels = new_tensor_dict['labels']
     num_classes = int(labels.tensor_[~torch.isnan(labels.tensor_)].max() + 1)
-    print(f"num_classes: {num_classes}")
+    new_tensor_dict['num_classes'] = num_classes
 
-    dataset = {
-        'csc_indptr': csc_indptr,
-        'csc_indices': csc_indices,
-        'train_nids': train_nids,
-        'valid_nids': valid_nids,
-        'test_nids': test_nids,
-        'features': features,
-        'labels': labels,
-        'num_classes': num_classes
-    }
+    return new_tensor_dict
 
-    return dataset
+
+def create_local_group():
+    cur, groups = torch.distributed.new_subgroups()
+    return torch.distributed.get_rank(cur), torch.distributed.get_world_size(
+        cur), cur
 
 
 if __name__ == "__main__":
-    a = load_dataset('.', pin_memory=True)
-    for i in a:
-        if i is not None:
-            print(i.tensor_.numel(), i.tensor_.shape)
+    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    tensor_dict = dist_load_tensor('./datasets')
+    for key, value in tensor_dict.items():
+        print(key, value.tensor_)
