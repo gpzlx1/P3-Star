@@ -84,7 +84,7 @@ class P3Trainer:
 
             for r, _input_nodes in enumerate(self.input_node_buffer_lst):
                 self.input_feat_buffer_lst[r] = self.emb_layer(
-                    _input_nodes.cpu()).cuda()
+                    _input_nodes).cuda()
 
             handle2.wait()
             handle3.wait()
@@ -171,7 +171,7 @@ class P3Trainer:
                 handle1.wait()
                 for r, _input_nodes in enumerate(self.input_node_buffer_lst):
                     self.input_feat_buffer_lst[r] = self.emb_layer(
-                        _input_nodes.to('cpu')).cuda()
+                        _input_nodes).cuda()
                 handle2.wait()
                 handle3.wait()
                 # 3. Fetch feature data and compute hid feature for other GPUs

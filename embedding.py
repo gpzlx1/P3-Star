@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 from dgl import backend as F
+from shmtensor import capi
+import weakref
 
 
 class Embedding(nn.Module):
@@ -16,8 +18,12 @@ class Embedding(nn.Module):
         self.emb_traces = []
         self.name = "embedding" + str(id(self))
 
+        capi.pin_memory(self.tensor)
+        weakref.finalize(self, capi.unpin_memory, self.tensor)
+
     def forward(self, ids):
-        emb = self.tensor[ids].cuda()
+        # emb = self.tensor[ids].cuda()
+        emb = capi.uva_fetch(self.tensor, ids)
 
         if not self.training:
             return emb
@@ -63,7 +69,19 @@ class SparseAdam(nn.Module):
             state_power = torch.zeros(
                 (param.num_embeddings, param.embedding_dim),
                 dtype=torch.float32)
+
             self._state[param.name] = (state_step, state_mem, state_power)
+
+            capi.pin_memory(self._state[param.name][0])
+            capi.pin_memory(self._state[param.name][1])
+            capi.pin_memory(self._state[param.name][2])
+
+            weakref.finalize(self, capi.unpin_memory,
+                             self._state[param.name][0])
+            weakref.finalize(self, capi.unpin_memory,
+                             self._state[param.name][1])
+            weakref.finalize(self, capi.unpin_memory,
+                             self._state[param.name][2])
 
     def update(self, idx, grad, emb):
         beta1 = self._beta1
@@ -75,10 +93,9 @@ class SparseAdam(nn.Module):
         # unique first
         grad_indices, grad_values = unique_grads(idx, grad)
 
-        state_idx = grad_indices.cpu()
-        state_step = state[0][state_idx]
-        orig_mem = state[1][state_idx]
-        orig_power = state[2][state_idx]
+        state_step = capi.uva_fetch(state[0], grad_indices)
+        orig_mem = capi.uva_fetch(state[1], grad_indices)
+        orig_power = capi.uva_fetch(state[2], grad_indices)
 
         state_step = state_step.cuda()
         orig_mem = orig_mem.cuda()
@@ -91,9 +108,13 @@ class SparseAdam(nn.Module):
         update_mem = beta1 * orig_mem + (1.0 - beta1) * grad_mem
         update_power = beta2 * orig_power + (1.0 - beta2) * grad_power
 
-        state[0][state_idx] = state_step.cpu()
-        state[1][state_idx] = update_mem.cpu()
-        state[2][state_idx] = update_power.cpu()
+        #state[0][state_idx] = state_step.cpu()
+        #state[1][state_idx] = update_mem.cpu()
+        #state[2][state_idx] = update_power.cpu()
+
+        capi.uva_set(state[0], grad_indices, state_step)
+        capi.uva_set(state[1], grad_indices, update_mem)
+        capi.uva_set(state[2], grad_indices, update_power)
 
         update_mem_corr = update_mem / (1.0 - torch.pow(
             torch.tensor(beta1, device='cuda'), state_step)).unsqueeze(1)
@@ -102,7 +123,11 @@ class SparseAdam(nn.Module):
         std_values = clr * update_mem_corr / (torch.sqrt(update_power_corr) +
                                               eps)
 
-        emb.tensor[state_idx] -= std_values.cpu()
+        # emb.tensor[state_idx] -= std_values.cpu()
+
+        update_emb = capi.uva_fetch(emb.tensor, grad_indices)
+        update_emb = update_emb - std_values
+        capi.uva_set(emb.tensor, grad_indices, update_emb)
 
     def zero_grad(self):
         self._clean_grad = True
