@@ -10,6 +10,7 @@ from models.gat import create_gat_p3
 import time
 from dgl import create_block
 import tqdm
+import numpy as np
 import torch.nn.functional as F
 import torchmetrics as MF
 from embedding import Embedding, SparseAdam
@@ -23,6 +24,8 @@ def main(args, dataset):
     nccl_world_size = dist.get_world_size()
 
     # local embedding feature
+    if nccl_rank == 0:
+        print("Create p3 embedding")
     local_embedding_size = args.embedding_size // nccl_world_size
     embedding_feature = Embedding(dataset['csc_indptr'].tensor_.numel() - 1,
                                   local_embedding_size)
@@ -30,14 +33,19 @@ def main(args, dataset):
     #local_embedding_size = dataset['features'].tensor_.size(1)
     #embedding_feature = dataset['features'].tensor_
 
+    if nccl_rank == 0:
+        print("Create dgl graph")
     labels = dataset['labels'].tensor_
     train_nids = dataset['train_nids'].tensor_
     test_nids = dataset['test_nids'].tensor_
+    valid_nids = dataset['valid_nids'].tensor_
     g = dgl.graph(
         ('csr', (dataset['csc_indptr'].tensor_, dataset['csc_indices'].tensor_,
                  torch.Tensor())))
 
     # set model
+    if nccl_rank == 0:
+        print("Create p3 model")
     if args.model == "sage":
         hidden_size = args.hidden_size
         local_model, global_model = create_sage_p3(local_embedding_size,
@@ -57,33 +65,50 @@ def main(args, dataset):
 
     if nccl_world_size > 1:
         global_model = torch.nn.parallel.DistributedDataParallel(
-            global_model, device_ids=[nccl_rank])
+            global_model, device_ids=[nccl_rank % args.num_trainers])
 
     # set optimizer
+    if nccl_rank == 0:
+        print("Create optimizers")
     global_optimizer = torch.optim.Adam(global_model.parameters(), lr=args.lr)
     local_optimizer = torch.optim.Adam(local_model.parameters(), lr=args.lr)
     emb_optimizer = SparseAdam((embedding_feature, ), lr=args.sparse_lr)
 
     # train
     # set dataloader
+    if nccl_rank == 0:
+        print("Create dgl sampler and dataloader")
     sampler = dgl.dataloading.NeighborSampler(args.fanouts)
     dataloader = dgl.dataloading.DataLoader(g,
                                             train_nids,
                                             sampler,
+                                            device="cuda",
                                             batch_size=args.batch_size,
                                             shuffle=True,
                                             drop_last=False,
                                             use_ddp=True,
                                             use_uva=True)
 
+    if nccl_rank == 0:
+        print("Create p3 trainer")
     trainer = P3Trainer(embedding_feature, local_model, global_model,
                         emb_optimizer, local_optimizer, global_optimizer,
                         F.cross_entropy, hidden_size,
                         dataset['csc_indptr'].tensor_.dtype)
 
     # train
-    for i in range(10):
+    if nccl_rank == 0:
+        print("Start training")
+    timelst = []
+    for i in range(args.total_epochs):
+        tic = time.time()
         trainer.train_one_epoch(dataloader, labels)
+        toc = time.time()
+        epoch_time = toc - tic
+        reduce_tensor = torch.tensor([epoch_time]).cuda()
+        dist.all_reduce(reduce_tensor, dist.ReduceOp.SUM)
+        epoch_time = reduce_tensor[0].item() / dist.get_world_size()
+        timelst.append(epoch_time)
 
         # inference
         test_dataloader = dgl.dataloading.DataLoader(
@@ -95,10 +120,24 @@ def main(args, dataset):
             drop_last=False,
             use_ddp=True,
             use_uva=True)
-        acc = trainer.inference(test_dataloader, labels,
-                                dataset['num_classes'])
+        test_acc = trainer.inference(test_dataloader, labels,
+                                     dataset['num_classes'])
+        valid_dataloader = dgl.dataloading.DataLoader(
+            g,
+            valid_nids,
+            sampler,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=False,
+            use_ddp=True,
+            use_uva=True)
+        valid_acc = trainer.inference(valid_dataloader, labels,
+                                      dataset['num_classes'])
         if nccl_rank == 0:
-            print(acc)
+            print("Epoch time: {:.3f} s, Valid acc: {:.3f}, Test acc: {:.3f}".
+                  format(epoch_time, valid_acc, test_acc))
+    if nccl_rank == 0:
+        print("Avg epoch time: {:.3f} s".format(np.mean(timelst[1:])))
 
 
 if __name__ == '__main__':
@@ -131,6 +170,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', default=0.003, type=float)
     parser.add_argument('--sparse-lr', default=1e-2, type=float)
     parser.add_argument('--fanouts', default="5, 10, 15", type=str)
+    parser.add_argument('--num-trainers', default=2, type=int)
     args = parser.parse_args()
     print(args)
     args.fanouts = [int(i) for i in args.fanouts.split(',')]
@@ -143,10 +183,10 @@ if __name__ == '__main__':
     dist.init_process_group('nccl', init_method='env://')
 
     ## set device
-    torch.cuda.set_device(dist.get_rank())
+    torch.cuda.set_device(dist.get_rank() % args.num_trainers)
 
     print("load dataset")
-    dataset = load_dataset(args.load_path, pin_memory=False, with_feat=True)
+    dataset = load_dataset(args.load_path, pin_memory=False, with_feat=False)
     print("finish load dataset")
 
     main(args, dataset)

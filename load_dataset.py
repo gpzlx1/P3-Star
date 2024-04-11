@@ -23,7 +23,8 @@ def load_dataset(load_path, pin_memory=False, with_feat=False):
     else:
         features = None
 
-    num_classes = int(labels.tensor_.max() + 1)
+    num_classes = int(labels.tensor_[~torch.isnan(labels.tensor_)].max() + 1)
+    print(f"num_classes: {num_classes}")
 
     dataset = {
         'csc_indptr': csc_indptr,
