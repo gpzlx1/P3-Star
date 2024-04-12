@@ -67,7 +67,6 @@ def main(args, dataset):
     local_optimizer = torch.optim.Adam(local_model.parameters(), lr=args.lr)
     emb_optimizer = SparseAdam((embedding_feature, ), lr=args.sparse_lr)
 
-    # train
     # set dataloader
     if nccl_rank == 0:
         print("Create gpu sampling dataloader")
@@ -79,6 +78,13 @@ def main(args, dataset):
                                        shuffle=True,
                                        drop_last=False,
                                        use_ddp=True)
+    if nccl_rank == 0:
+        print("Start presampling")
+    tic = time.time()
+    sampling_hotness, embedding_hotness = dataloader.presampling()
+    toc = time.time()
+    if nccl_rank == 0:
+        print("Presampling time: {:.3f} s".format(toc - tic))
 
     if nccl_rank == 0:
         print("Create p3 trainer")
@@ -92,6 +98,29 @@ def main(args, dataset):
         print("Start training")
     timelst = []
     for i in range(args.total_epochs):
+        if i == 1:
+            # create GPU cache
+            if nccl_rank == 0:
+                print("Create GPU cache")
+            capacity = torch.cuda.mem_get_info(torch.cuda.current_device(
+            ))[1] - torch.cuda.max_memory_allocated(
+            ) - args.reversed_cuda_mem * 1024 * 1024 * 1024
+            embedding_item_size = embedding_feature.tensor.element_size(
+            ) + emb_optimizer.itemsize(embedding_feature.name)
+            avg_degree = dataset['csc_indices'].tensor_.numel() / (
+                dataset['csc_indptr'].tensor_.numel() - 1)
+            sampling_item_size = avg_degree * dataset[
+                'csc_indices'].tensor_.element_size(
+                ) + dataset['csc_indptr'].tensor_.element_size()
+            embedding_capacity = int(
+                capacity * embedding_item_size /
+                (embedding_item_size + sampling_item_size))
+            sampling_capacity = int(capacity * sampling_item_size /
+                                    (embedding_item_size + sampling_item_size))
+            embedding_feature.create_cache(embedding_capacity,
+                                           embedding_hotness, emb_optimizer)
+            dataloader.create_cache(sampling_capacity, sampling_hotness)
+
         tic = time.time()
         dataloader.update_params(seeds=train_nids)
         trainer.train_one_epoch(dataloader, labels)
@@ -158,6 +187,7 @@ if __name__ == '__main__':
     parser.add_argument('--sparse-lr', default=1e-2, type=float)
     parser.add_argument('--fanouts', default="5, 10, 15", type=str)
     parser.add_argument('--num-trainers', default=2, type=int)
+    parser.add_argument('--reversed-cuda-mem', default=2.0, type=float)
     args = parser.parse_args()
     print(args)
     args.fanouts = [int(i) for i in args.fanouts.split(',')]
