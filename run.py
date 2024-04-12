@@ -8,7 +8,7 @@ from models.gat import create_gat_p3
 import time
 import numpy as np
 import torch.nn.functional as F
-from embedding import Embedding, SparseAdam
+from embedding import Embedding, SparseAdam, SparseAdagrad
 from trainer import P3Trainer
 from shmtensor import GPUSamplingDataloader
 
@@ -65,7 +65,10 @@ def main(args, dataset):
         print("Create optimizers")
     global_optimizer = torch.optim.Adam(global_model.parameters(), lr=args.lr)
     local_optimizer = torch.optim.Adam(local_model.parameters(), lr=args.lr)
-    emb_optimizer = SparseAdam((embedding_feature, ), lr=args.sparse_lr)
+    if args.emb_optim == "adam":
+        emb_optimizer = SparseAdam((embedding_feature, ), lr=args.sparse_lr)
+    elif args.emb_optim == "adagrad":
+        emb_optimizer = SparseAdagrad((embedding_feature, ), lr=args.sparse_lr)
 
     # set dataloader
     if nccl_rank == 0:
@@ -184,6 +187,11 @@ if __name__ == '__main__':
     parser.add_argument("--heads", type=str, default="8,8,1")
     parser.add_argument('--num-layers', default=3, type=int)
     parser.add_argument('--lr', default=0.003, type=float)
+    parser.add_argument('--emb-optim',
+                        default="adam",
+                        type=str,
+                        help='Embedding optimizer type: adam or adagrad',
+                        choices=['adam', 'adagrad'])
     parser.add_argument('--sparse-lr', default=1e-2, type=float)
     parser.add_argument('--fanouts', default="5, 10, 15", type=str)
     parser.add_argument('--num-trainers', default=2, type=int)
