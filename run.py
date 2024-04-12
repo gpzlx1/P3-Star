@@ -110,14 +110,14 @@ def main(args, dataset):
             ) - args.reversed_cuda_mem * 1024 * 1024 * 1024
             embedding_item_size = (
                 embedding_feature.tensor.element_size() +
-                emb_optimizer.itemsize(embedding_feature.name)
-            ) * torch.mean(embedding_hotness).item()
+                emb_optimizer.itemsize(embedding_feature.name)) * torch.mean(
+                    embedding_hotness[embedding_hotness > 0]).item()
             avg_degree = dataset['csc_indices'].tensor_.numel() / (
                 dataset['csc_indptr'].tensor_.numel() - 1)
             sampling_item_size = (
                 avg_degree * dataset['csc_indices'].tensor_.element_size() +
-                dataset['csc_indptr'].tensor_.element_size()
-            ) * torch.mean(sampling_hotness).item()
+                dataset['csc_indptr'].tensor_.element_size()) * torch.mean(
+                    sampling_hotness[sampling_hotness > 0]).item()
             embedding_capacity = int(
                 capacity * embedding_item_size /
                 (embedding_item_size + sampling_item_size))
