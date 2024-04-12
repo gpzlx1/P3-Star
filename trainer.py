@@ -114,7 +114,7 @@ class P3Trainer:
                 self.rank, self.world_size,
                 self.local_hid_buffer_lst[self.rank],
                 self.local_hid_buffer_lst, self.global_grad_lst)
-            output_labels = labels[output_nodes.cpu()].cuda()
+            output_labels = labels[output_nodes.cpu()].cuda().long()
             output_pred = self.other_layer(blocks[1:], local_hid)
             loss = F.cross_entropy(output_pred, output_labels)
 
@@ -200,7 +200,7 @@ class P3Trainer:
                     self.rank, self.world_size,
                     self.local_hid_buffer_lst[self.rank],
                     self.local_hid_buffer_lst, None)
-                ys.append(labels[output_nodes.cpu()].cpu())
+                ys.append(labels[output_nodes.cpu()].cpu().long())
                 y_hats.append(self.other_layer(blocks[1:], local_hid).cpu())
 
         acc = MF.Accuracy(task="multiclass", num_classes=num_classes)
