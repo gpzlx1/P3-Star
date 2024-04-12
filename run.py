@@ -108,13 +108,16 @@ def main(args, dataset):
             capacity = torch.cuda.mem_get_info(torch.cuda.current_device(
             ))[1] - torch.cuda.max_memory_allocated(
             ) - args.reversed_cuda_mem * 1024 * 1024 * 1024
-            embedding_item_size = embedding_feature.tensor.element_size(
-            ) + emb_optimizer.itemsize(embedding_feature.name)
+            embedding_item_size = (
+                embedding_feature.tensor.element_size() +
+                emb_optimizer.itemsize(embedding_feature.name)
+            ) * torch.mean(embedding_hotness).item()
             avg_degree = dataset['csc_indices'].tensor_.numel() / (
                 dataset['csc_indptr'].tensor_.numel() - 1)
-            sampling_item_size = avg_degree * dataset[
-                'csc_indices'].tensor_.element_size(
-                ) + dataset['csc_indptr'].tensor_.element_size()
+            sampling_item_size = (
+                avg_degree * dataset['csc_indices'].tensor_.element_size() +
+                dataset['csc_indptr'].tensor_.element_size()
+            ) * torch.mean(sampling_hotness).item()
             embedding_capacity = int(
                 capacity * embedding_item_size /
                 (embedding_item_size + sampling_item_size))
