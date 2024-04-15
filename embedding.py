@@ -23,7 +23,11 @@ class Embedding(nn.Module):
 
     def forward(self, ids):
         # emb = self.tensor[ids].cuda()
-        emb = capi.uva_fetch(self.tensor, ids)
+        if getattr(self, 'has_cache', None):
+            emb = capi.cache_fetch(self.tensor, self.gpu_tensor, ids,
+                                   self.hashmap)
+        else:
+            emb = capi.uva_fetch(self.tensor, ids)
 
         if not self.training:
             return emb
@@ -37,6 +41,39 @@ class Embedding(nn.Module):
             self.emb_traces.append(emb)
 
         return emb
+
+    def create_cache(self, cache_capacity, hotness, optimizer):
+        if cache_capacity <= 0:
+            return
+
+        full_size = self.tensor.nbytes + self.num_embeddings * optimizer.itemsize(
+            self.name)
+        if full_size <= cache_capacity:
+            self.tensor = self.tensor.cuda()
+            optimizer.create_cache(self.name, full=True)
+            print("Cache Ratio for GPU embedding: {:.2f}".format(
+                cache_capacity / full_size))
+            return
+
+        _, cache_candidates = torch.sort(hotness, descending=True)
+        itemsize = self.tensor.element_size() * optimizer.itemsize(self.name)
+        cache_size = cache_capacity // itemsize
+        cache_candidates = cache_candidates[:cache_size]
+
+        if cache_candidates.numel() > 0:
+            self.gpu_tensor = self.tensor[cache_candidates].cuda()
+            self.hashmap = capi.CUCOStaticHashmap(
+                cache_candidates.cuda(),
+                torch.arange(cache_candidates.numel(),
+                             device='cuda',
+                             dtype=cache_candidates.dtype), 0.8)
+            optimizer.create_cache(self.name,
+                                   full=False,
+                                   cache_candidates=cache_candidates)
+            self.has_cache = True
+            print("Cache Ratio for GPU embedding: {:.2f}".format(
+                cache_size * itemsize / full_size))
+            print("create cache success")
 
 
 def unique_grads(idx, grad):
@@ -60,6 +97,11 @@ class SparseAdam(nn.Module):
         self._beta1, self._beta2 = betas
         self._lr = lr
         self._state = {}
+        self._gpu_state = {}
+        self._emb_transfer_stream = torch.cuda.Stream()
+        self._emb_transfer_event = torch.cuda.Event()
+        self._state_transfer_stream = torch.cuda.Stream()
+        self._state_transfer_event = torch.cuda.Event()
 
         for param in params:
             state_step = torch.zeros(param.num_embeddings, dtype=torch.float32)
@@ -92,14 +134,34 @@ class SparseAdam(nn.Module):
 
         # unique first
         grad_indices, grad_values = unique_grads(idx, grad)
+        # query hashmap
+        if getattr(emb, 'has_cache', None):
+            cached_mask = emb.hashmap.query(grad_indices)
+        # async fetch emb value
+        with torch.cuda.stream(self._emb_transfer_stream):
+            if getattr(emb, 'has_cache', None):
+                update_emb = capi.cache_fetch_with_mask(
+                    emb.tensor, emb.gpu_tensor, grad_indices, cached_mask)
+            else:
+                update_emb = capi.uva_fetch(emb.tensor, grad_indices)
+        self._emb_transfer_event.record(self._emb_transfer_stream)
 
-        state_step = capi.uva_fetch(state[0], grad_indices)
-        orig_mem = capi.uva_fetch(state[1], grad_indices)
-        orig_power = capi.uva_fetch(state[2], grad_indices)
+        if emb.name not in self._gpu_state:
+            state_step = capi.uva_fetch(state[0], grad_indices)
+            orig_mem = capi.uva_fetch(state[1], grad_indices)
+            orig_power = capi.uva_fetch(state[2], grad_indices)
+        else:
+            gpu_state = self._gpu_state[emb.name]
+            state_step = capi.cache_fetch_with_mask(state[0], gpu_state[0],
+                                                    grad_indices, cached_mask)
+            orig_mem = capi.cache_fetch_with_mask(state[1], gpu_state[1],
+                                                  grad_indices, cached_mask)
+            orig_power = capi.cache_fetch_with_mask(state[2], gpu_state[2],
+                                                    grad_indices, cached_mask)
 
-        state_step = state_step.cuda()
-        orig_mem = orig_mem.cuda()
-        orig_power = orig_power.cuda()
+        # state_step = state_step.cuda()
+        # orig_mem = orig_mem.cuda()
+        # orig_power = orig_power.cuda()
 
         state_step = state_step + 1
 
@@ -112,9 +174,21 @@ class SparseAdam(nn.Module):
         #state[1][state_idx] = update_mem.cpu()
         #state[2][state_idx] = update_power.cpu()
 
-        capi.uva_set(state[0], grad_indices, state_step)
-        capi.uva_set(state[1], grad_indices, update_mem)
-        capi.uva_set(state[2], grad_indices, update_power)
+        # async update states
+        with torch.cuda.stream(self._state_transfer_stream):
+            if emb.name not in self._gpu_state:
+                capi.uva_set(state[0], grad_indices, state_step)
+                capi.uva_set(state[1], grad_indices, update_mem)
+                capi.uva_set(state[2], grad_indices, update_power)
+            else:
+                gpu_state = self._gpu_state[emb.name]
+                capi.cache_set_with_mask(state[0], gpu_state[0], grad_indices,
+                                         state_step, cached_mask)
+                capi.cache_set_with_mask(state[1], gpu_state[1], grad_indices,
+                                         update_mem, cached_mask)
+                capi.cache_set_with_mask(state[2], gpu_state[2], grad_indices,
+                                         update_power, cached_mask)
+        self._state_transfer_event.record(self._state_transfer_stream)
 
         update_mem_corr = update_mem / (1.0 - torch.pow(
             torch.tensor(beta1, device='cuda'), state_step)).unsqueeze(1)
@@ -123,11 +197,16 @@ class SparseAdam(nn.Module):
         std_values = clr * update_mem_corr / (torch.sqrt(update_power_corr) +
                                               eps)
 
-        # emb.tensor[state_idx] -= std_values.cpu()
-
-        update_emb = capi.uva_fetch(emb.tensor, grad_indices)
+        self._emb_transfer_event.synchronize()
         update_emb = update_emb - std_values
-        capi.uva_set(emb.tensor, grad_indices, update_emb)
+
+        if getattr(emb, 'has_cache', None):
+            capi.cache_set_with_mask(emb.tensor, emb.gpu_tensor, grad_indices,
+                                     update_emb, cached_mask)
+        else:
+            capi.uva_set(emb.tensor, grad_indices, update_emb)
+
+        self._state_transfer_event.synchronize()
 
     def zero_grad(self):
         self._clean_grad = True
@@ -141,6 +220,23 @@ class SparseAdam(nn.Module):
 
             param.ids_traces.clear()
             param.emb_traces.clear()
+
+    def itemsize(self, name):
+        state = self._state[name]
+        return state[0].element_size() + state[1].shape[1] * state[
+            1].element_size() + state[2].shape[1] * state[2].element_size()
+
+    def create_cache(self, name, full=False, cache_candidates=None):
+        state = self._state[name]
+        if full:
+            self._state[name] = (state[0].cuda(), state[1].cuda(),
+                                 state[2].cuda())
+
+        else:
+            cache_candidates = cache_candidates.cpu()
+            self._gpu_state[name] = (state[0][cache_candidates].cuda(),
+                                     state[1][cache_candidates].cuda(),
+                                     state[2][cache_candidates].cuda())
 
 
 class SparseAdagrad(nn.Module):
@@ -152,11 +248,18 @@ class SparseAdagrad(nn.Module):
         self._eps = eps
         self._lr = lr
         self._state = {}
+        self._gpu_state = {}
+        self._emb_transfer_stream = torch.cuda.Stream()
+        self._emb_transfer_event = torch.cuda.Event()
+        self._state_transfer_stream = torch.cuda.Stream()
+        self._state_transfer_event = torch.cuda.Event()
 
         for param in params:
             state = torch.zeros((param.num_embeddings, param.embedding_dim),
                                 dtype=torch.float32)
             self._state[param.name] = state
+            capi.pin_memory(self._state[param.name])
+            weakref.finalize(self, capi.unpin_memory, self._state[param.name])
 
     def update(self, idx, grad, emb):
         eps = self._eps
@@ -165,20 +268,50 @@ class SparseAdagrad(nn.Module):
 
         # unique first
         grad_indices, grad_values = unique_grads(idx, grad)
+        # query hashmap
+        if getattr(emb, 'has_cache', None):
+            cached_mask = emb.hashmap.query(grad_indices)
+        # async fetch emb value
+        with torch.cuda.stream(self._emb_transfer_stream):
+            if getattr(emb, 'has_cache', None):
+                update_emb = capi.cache_fetch_with_mask(
+                    emb.tensor, emb.gpu_tensor, grad_indices, cached_mask)
+            else:
+                update_emb = capi.uva_fetch(emb.tensor, grad_indices)
+        self._emb_transfer_event.record(self._emb_transfer_stream)
 
-        state_idx = grad_indices.cpu()
-        state_value = state[state_idx]
-        state_value = state_value.cuda()
+        if emb.name not in self._gpu_state:
+            state_value = capi.uva_fetch(state, grad_indices)
+        else:
+            gpu_state = self._gpu_state[emb.name]
+            state_value = capi.cache_fetch_with_mask(state, gpu_state,
+                                                     grad_indices, cached_mask)
 
         grad_sum = grad_values * grad_values
         state_value += grad_sum
 
-        state[state_idx] = state_value.cpu()
+        # async update state value
+        with torch.cuda.stream(self._state_transfer_stream):
+            if emb.name not in self._gpu_state:
+                capi.uva_set(state, grad_indices, state_value)
+            else:
+                gpu_state = self._gpu_state[emb.name]
+                capi.cache_set_with_mask(state, gpu_state, grad_indices,
+                                         state_value, cached_mask)
+        self._state_transfer_event.record(self._state_transfer_stream)
 
-        std_values = state_value.sqrt_().add_(eps)
+        std_values = torch.sqrt(state_value) + eps
         tmp = clr * grad_values / std_values
+        self._emb_transfer_event.synchronize()
+        update_emb -= tmp
 
-        emb.tensor[state_idx] -= tmp.cpu()
+        if getattr(emb, 'has_cache', None):
+            capi.cache_set_with_mask(emb.tensor, emb.gpu_tensor, grad_indices,
+                                     update_emb, cached_mask)
+        else:
+            capi.uva_set(emb.tensor, grad_indices, update_emb)
+
+        self._state_transfer_event.synchronize()
 
     def zero_grad(self):
         self._clean_grad = True
@@ -192,3 +325,13 @@ class SparseAdagrad(nn.Module):
 
             param.ids_traces.clear()
             param.emb_traces.clear()
+
+    def itemsize(self, name):
+        return self._state[name].shape[1] * self._state[name].element_size()
+
+    def create_cache(self, name, full=False, cache_candidates=None):
+        if full:
+            self._state[name] = self._state[name].cuda()
+        else:
+            cache_candidates = cache_candidates.cpu()
+            self._gpu_state[name] = self._state[name][cache_candidates].cuda()
