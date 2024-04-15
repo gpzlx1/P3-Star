@@ -33,8 +33,8 @@ class Embedding(nn.Module):
 
         if F.is_recording():
             emb = F.attach_grad(emb)
-            self.ids_traces.append(ids.to('cuda', non_blocking=True))
-            self.emb_traces.append(emb.to('cuda', non_blocking=True))
+            self.ids_traces.append(ids)
+            self.emb_traces.append(emb)
 
         return emb
 

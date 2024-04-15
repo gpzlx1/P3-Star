@@ -84,14 +84,14 @@ class P3Trainer:
 
             for r, _input_nodes in enumerate(self.input_node_buffer_lst):
                 self.input_feat_buffer_lst[r] = self.emb_layer(
-                    _input_nodes).cuda()
+                    _input_nodes) # .cuda()
 
             handle2.wait()
             handle3.wait()
 
             block = None
             for r in range(self.world_size):
-                input_nodes = self.input_node_buffer_lst[r]
+                # input_nodes = self.input_node_buffer_lst[r]
                 input_feats = self.input_feat_buffer_lst[r]
                 if r == self.rank:
                     block = top_block
@@ -124,13 +124,16 @@ class P3Trainer:
 
             loss.backward()
 
+            self.other_optimizer.step()
+
             for r, global_grad in enumerate(self.global_grad_lst):
                 if r != self.rank:
                     self.local_hid_buffer_lst[r].backward(global_grad)
 
-            self.emb_optimizer.step()
             self.first_optimizer.step()
-            self.other_optimizer.step()
+            self.emb_optimizer.step()
+            
+            
 
     def inference(self, dataloader, labels, num_classes):
         self.emb_layer.eval()
